@@ -15,6 +15,8 @@
 //!   parameter  — each item in `parameters` (label = name : default)
 //!   library    — each library entry within a task
 
+mod source_spans;
+
 use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
 use serde_json::Value;
 
@@ -196,7 +198,7 @@ fn parse_parameter(id: &str, param: &Value) -> Option<SemanticNode> {
     Some(leaf(id, "parameter", &label))
 }
 
-fn parse_job(val: &Value) -> String {
+fn parse_job(val: &Value, source: &str) -> String {
     let root_map = match val.as_object() {
         Some(m) => m,
         None => return r#"{"error":"Not a JSON/YAML object"}"#.to_string(),
@@ -235,7 +237,10 @@ fn parse_job(val: &Value) -> String {
         }
     }
 
-    let root = parent_node("0", "job", &job_name, children);
+    let mut root = parent_node("0", "job", &job_name, children);
+    if let Err(error) = source_spans::attach(&mut root, source) {
+        return serde_json::json!({"error": error}).to_string();
+    }
     match serde_json::to_string(&root) {
         Ok(s) => s,
         Err(e) => format!(r#"{{"error":"Serialisation error: {}"}}"#, e),
@@ -251,7 +256,7 @@ fn process_impl(source: &str) -> String {
     } else {
         return r#"{"error":"Failed to parse as YAML or JSON"}"#.to_string();
     };
-    parse_job(&val)
+    parse_job(&val, source)
 }
 
 impl Guest for DatabricksParser {
@@ -307,6 +312,24 @@ mod tests {
     use super::*;
     use crate::exports::intentdiff::plugin::parser::Guest;
     use intentumdiff_plugin_sdk::testing as t;
+
+    #[test]
+    fn workflow_nodes_retain_distinct_yaml_and_json_source_ranges() {
+        let source = "name: café\nparameters:\n  - name: env\n    default: prod\ntasks:\n  - task_key: same\n    notebook_task: {notebook_path: /one}\n  - task_key: same\n    notebook_task: {notebook_path: /two}\n    depends_on:\n      - task_key: same\n";
+        let tree: Value = serde_json::from_str(&process_impl(source)).unwrap();
+        let nodes = tree["children"].as_array().unwrap();
+        assert_eq!(nodes[0]["position"]["start_line"], 5);
+        assert_eq!(nodes[0]["position"]["start_col"], 4);
+        assert_eq!(nodes[1]["position"]["start_line"], 7);
+        assert_eq!(nodes[2]["position"]["start_line"], 2);
+        assert_eq!(nodes[1]["children"][0]["position"]["start_line"], 10);
+        let json = "{\"name\":\"café\",\"tasks\":[{\"task_key\":\"same\",\"notebook_task\":{}}]}";
+        let tree: Value = serde_json::from_str(&process_impl(json)).unwrap();
+        assert_eq!(
+            tree["children"][0]["position"]["start_col"],
+            json.find("{\"task_key").unwrap()
+        );
+    }
 
     #[test]
     fn grammar_id_nonempty() {
