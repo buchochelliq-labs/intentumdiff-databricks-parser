@@ -15,6 +15,7 @@
 //!   parameter  — each item in `parameters` (label = name : default)
 //!   library    — each library entry within a task
 
+mod json_spans;
 mod source_spans;
 
 use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
@@ -198,7 +199,7 @@ fn parse_parameter(id: &str, param: &Value) -> Option<SemanticNode> {
     Some(leaf(id, "parameter", &label))
 }
 
-fn parse_job(val: &Value, source: &str) -> String {
+fn parse_job(val: &Value, source: &str, is_json: bool) -> String {
     let root_map = match val.as_object() {
         Some(m) => m,
         None => return r#"{"error":"Not a JSON/YAML object"}"#.to_string(),
@@ -238,7 +239,7 @@ fn parse_job(val: &Value, source: &str) -> String {
     }
 
     let mut root = parent_node("0", "job", &job_name, children);
-    if let Err(error) = source_spans::attach(&mut root, source) {
+    if let Err(error) = source_spans::attach(&mut root, source, is_json) {
         return serde_json::json!({"error": error}).to_string();
     }
     match serde_json::to_string(&root) {
@@ -249,14 +250,14 @@ fn parse_job(val: &Value, source: &str) -> String {
 
 fn process_impl(source: &str) -> String {
     // Try YAML first (superset of JSON); fall back to serde_json for pure JSON
-    let val: Value = if let Ok(v) = serde_yaml::from_str::<Value>(source) {
-        v
+    let (val, is_json) = if let Ok(v) = serde_yaml::from_str::<Value>(source) {
+        (v, false)
     } else if let Ok(v) = serde_json::from_str::<Value>(source) {
-        v
+        (v, true)
     } else {
         return r#"{"error":"Failed to parse as YAML or JSON"}"#.to_string();
     };
-    parse_job(&val, source)
+    parse_job(&val, source, is_json)
 }
 
 impl Guest for DatabricksParser {
@@ -312,6 +313,54 @@ mod tests {
     use super::*;
     use crate::exports::intentdiff::plugin::parser::Guest;
     use intentumdiff_plugin_sdk::testing as t;
+
+    #[test]
+    fn large_workflows_keep_last_task_byte_ranges() {
+        for count in [500, 2000] {
+            let yaml = format!(
+                "name: café\ntasks:\n{}",
+                "  - task_key: same\n    notebook_task: {notebook_path: /x}\n".repeat(count)
+            );
+            let json = format!(
+                r#"{{"name":"café","tasks":[{}]}}"#,
+                vec![r#"{"task_key":"same","notebook_task":{}}"#; count].join(",")
+            );
+            for source in [yaml, json] {
+                let start = std::time::Instant::now();
+                let output = process_impl(&source);
+                eprintln!(
+                    "span-scaling count={count} multiline={} elapsed={:?}",
+                    source.contains('\n'),
+                    start.elapsed()
+                );
+                let tree: Value = serde_json::from_str(&output).unwrap();
+                assert!(tree.get("error").is_none(), "{tree}");
+                let nodes = tree["children"].as_array().unwrap();
+                assert_eq!(nodes.len(), count);
+                if source.contains('\n') {
+                    assert_eq!(nodes[count - 1]["position"]["start_line"], count * 2);
+                    assert_eq!(nodes[count - 1]["position"]["start_col"], 4);
+                } else {
+                    assert_eq!(
+                        nodes[count - 1]["position"]["start_col"],
+                        source.rfind("{\"task_key").unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn json_surrogate_pairs_keep_semantics_and_original_byte_ranges() {
+        let source =
+            r#"{"name":"\uD83D\uDE80","tasks":[{"task_key":"launch","notebook_task":{}}]}"#;
+        let tree: Value = serde_json::from_str(&process_impl(source)).unwrap();
+        assert!(tree.get("error").is_none(), "{tree}");
+        assert_eq!(tree["label"], "🚀");
+        assert_eq!(tree["children"][0]["position"]["start_line"], 0);
+        assert_eq!(tree["children"][0]["position"]["start_col"], 32);
+        assert_eq!(tree["children"][0]["position"]["end_col"], 72);
+    }
 
     #[test]
     fn workflow_nodes_retain_distinct_yaml_and_json_source_ranges() {
