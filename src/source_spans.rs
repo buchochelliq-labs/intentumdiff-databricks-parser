@@ -23,20 +23,46 @@ impl MarkedEventReceiver for Events {
     }
 }
 
-// Scanner columns count Unicode characters; semantic positions use UTF-8 bytes.
-fn point(source: &str, mark: Marker) -> (u32, u32) {
-    let line = mark.line().saturating_sub(1);
-    let text = source.lines().nth(line).unwrap_or("");
-    let col = text
-        .char_indices()
-        .nth(mark.col())
-        .map_or(text.len(), |(byte, _)| byte);
-    (line as u32, col as u32)
+// Index lines once; only non-ASCII lines need character-to-byte tables.
+struct SourceMap<'a> {
+    lines: Vec<&'a str>,
+    unicode: HashMap<usize, Vec<usize>>,
+}
+impl<'a> SourceMap<'a> {
+    fn new(source: &'a str) -> Self {
+        let lines: Vec<_> = source.lines().collect();
+        let unicode = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| !line.is_ascii())
+            .map(|(i, line)| {
+                (
+                    i,
+                    line.char_indices()
+                        .map(|(byte, _)| byte)
+                        .chain(std::iter::once(line.len()))
+                        .collect(),
+                )
+            })
+            .collect();
+        Self { lines, unicode }
+    }
+    fn point(&self, mark: Marker) -> (u32, u32) {
+        let line = mark.line().saturating_sub(1);
+        let text = self.lines.get(line).copied().unwrap_or("");
+        let col = self
+            .unicode
+            .get(&line)
+            .map_or(mark.col().min(text.len()), |offsets| {
+                offsets.get(mark.col()).copied().unwrap_or(text.len())
+            });
+        (line as u32, col as u32)
+    }
 }
 fn read_node(
     events: &[(Event, Marker)],
     cursor: &mut usize,
-    source: &str,
+    source: &SourceMap<'_>,
     anchors: &mut HashMap<usize, Span>,
     depth: usize,
 ) -> Result<Span, String> {
@@ -89,13 +115,13 @@ fn read_node(
         }
         _ => return Err("Unexpected YAML source event".into()),
     };
-    let start_point = point(source, start);
+    let start_point = source.point(start);
     let (start_line, start_col) = first_key.map_or(start_point, |key| key.min(start_point));
-    let (end_line, mut end_col) = point(source, end);
+    let (end_line, mut end_col) = source.point(end);
     if collection
         && source
-            .lines()
-            .nth(end_line as usize)
+            .lines
+            .get(end_line as usize)
             .and_then(|line| line.get(end_col as usize..))
             .is_some_and(|rest| rest.starts_with('}') || rest.starts_with(']'))
     {
@@ -125,7 +151,10 @@ fn at<'a>(mut span: &'a Span, path: &[&str]) -> Option<&'a Span> {
     }
     Some(span)
 }
-fn assign(node: &mut SemanticNode, spans: &Span) -> Result<(), String> {
+fn assign(
+    node: &mut SemanticNode,
+    position: &mut impl FnMut(&[&str]) -> Option<Position>,
+) -> Result<(), String> {
     let parts: Vec<_> = node.id.split('.').collect();
     let mut path = Vec::new();
     if parts.len() > 1 {
@@ -145,16 +174,17 @@ fn assign(node: &mut SemanticNode, spans: &Span) -> Result<(), String> {
             path.push(parts.get(4).ok_or("Missing task source index")?);
         }
     }
-    node.position = at(spans, &path)
-        .ok_or("Missing workflow source span")?
-        .position
-        .clone();
+    node.position = position(&path).ok_or("Missing workflow source span")?;
     for child in &mut node.children {
-        assign(child, spans)?;
+        assign(child, position)?;
     }
     Ok(())
 }
-pub(crate) fn attach(node: &mut SemanticNode, source: &str) -> Result<(), String> {
+pub(crate) fn attach(node: &mut SemanticNode, source: &str, is_json: bool) -> Result<(), String> {
+    if is_json {
+        let mut spans = crate::json_spans::JsonSpans::new(source)?;
+        return assign(node, &mut |path| spans.position(path));
+    }
     let mut events = Events(Vec::new());
     Parser::new_from_str(source)
         .load(&mut events, false)
@@ -164,6 +194,14 @@ pub(crate) fn attach(node: &mut SemanticNode, source: &str) -> Result<(), String
         .iter()
         .position(|(e, _)| matches!(e, Event::MappingStart(..)))
         .ok_or("Missing workflow mapping")?;
-    let root = read_node(&events.0, &mut cursor, source, &mut HashMap::new(), 0)?;
-    assign(node, &root)
+    let root = read_node(
+        &events.0,
+        &mut cursor,
+        &SourceMap::new(source),
+        &mut HashMap::new(),
+        0,
+    )?;
+    assign(node, &mut |path| {
+        at(&root, path).map(|span| span.position.clone())
+    })
 }
