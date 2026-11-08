@@ -15,8 +15,12 @@
 //!   parameter  — each item in `parameters` (label = name : default)
 //!   library    — each library entry within a task
 
+mod configuration;
 mod json_spans;
 mod source_spans;
+
+#[cfg(test)]
+mod tests_configuration;
 
 use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
 use serde_json::Value;
@@ -239,7 +243,14 @@ fn parse_job(val: &Value, source: &str, is_json: bool) -> String {
     }
 
     let mut root = parent_node("0", "job", &job_name, children);
-    if let Err(error) = source_spans::attach(&mut root, source, is_json) {
+    let mut spans = match source_spans::SourceSpans::new(source, is_json) {
+        Ok(spans) => spans,
+        Err(error) => return serde_json::json!({"error": error}).to_string(),
+    };
+    if let Err(error) = spans
+        .attach(&mut root)
+        .and_then(|()| configuration::append(&mut root, val, source, &mut spans))
+    {
         return serde_json::json!({"error": error}).to_string();
     }
     match serde_json::to_string(&root) {
@@ -436,7 +447,12 @@ mod tests {
                 );
                 let tree: Value = serde_json::from_str(&output).unwrap();
                 assert!(tree.get("error").is_none(), "{tree}");
-                let nodes = tree["children"].as_array().unwrap();
+                let nodes: Vec<_> = tree["children"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|node| node["node_type"] == "task")
+                    .collect();
                 assert_eq!(nodes.len(), count);
                 if source.contains('\n') {
                     assert_eq!(nodes[count - 1]["position"]["start_line"], count * 2);
