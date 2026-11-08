@@ -314,6 +314,107 @@ mod tests {
     use crate::exports::intentdiff::plugin::parser::Guest;
     use intentumdiff_plugin_sdk::testing as t;
 
+    fn assert_raw_source_ranges(node: &Value, source: &str) {
+        let lines: Vec<_> = source.split('\n').collect();
+        let position = &node["position"];
+        let endpoint = |line: &str, col: &str| {
+            let row = position[line].as_u64().expect("integer source row") as usize;
+            let byte = position[col].as_u64().expect("integer byte column") as usize;
+            let text = lines
+                .get(row)
+                .unwrap_or_else(|| panic!("{node}: row {row} outside source"));
+            assert!(
+                byte <= text.len(),
+                "{node}: column {byte} outside row {row}"
+            );
+            assert!(
+                text.is_char_boundary(byte),
+                "{node}: column {byte} splits UTF-8"
+            );
+            (row, byte)
+        };
+        assert!(endpoint("start_line", "start_col") <= endpoint("end_line", "end_col"));
+        for child in node["children"].as_array().unwrap() {
+            assert_raw_source_ranges(child, source);
+        }
+    }
+
+    #[test]
+    fn yaml_root_ends_at_exact_eof_with_lf_and_crlf_variants() {
+        for (source, end_line, end_col) in [
+            ("name: job\ntasks: []", 1, 9),
+            ("name: job\ntasks: []\n", 2, 0),
+            ("name: job\r\ntasks: []", 1, 9),
+            ("name: job\r\ntasks: []\r\n", 2, 0),
+            ("name: café\ntasks: [] # 雪🚀", 1, 19),
+        ] {
+            let output = process_impl(source);
+            assert_eq!(output, process_impl(source));
+            let tree: Value = serde_json::from_str(&output).unwrap();
+            assert!(tree.get("error").is_none(), "{tree}");
+            assert_eq!(tree["position"]["end_line"], end_line, "{source:?}");
+            assert_eq!(tree["position"]["end_col"], end_col, "{source:?}");
+            assert_raw_source_ranges(&tree, source);
+        }
+    }
+
+    #[test]
+    fn partial_notebook_task_keeps_ranges_inside_original_source() {
+        for source in [
+            "name: x\ntasks:\n  - task_key: a\n    notebook_task:",
+            "tasks:\n  - task_key: ingest\n    notebook_task:",
+            "tasks:\n  - task_key: ingest\n    notebook_task:\n",
+            "tasks:\r\n  - task_key: ingest\r\n    notebook_task:",
+        ] {
+            let tree: Value = serde_json::from_str(&process_impl(source)).unwrap();
+            assert!(tree.get("error").is_none(), "{tree}");
+            assert_eq!(tree["children"][0]["id"], "0.task.0");
+            assert_eq!(
+                tree["children"][0]["position"]["start_line"],
+                if source.starts_with("name:") { 2 } else { 1 }
+            );
+            assert_eq!(tree["children"][0]["position"]["start_col"], 4);
+            assert_raw_source_ranges(&tree, source);
+        }
+        let incomplete: Value =
+            serde_json::from_str(&process_impl("tasks:\n  - task_key: \"")).unwrap();
+        assert!(incomplete["error"].is_string());
+    }
+
+    #[test]
+    fn multiblock_workflow_keeps_indexed_ids_and_distinct_ranges_at_eof() {
+        let yaml = "name: café\ntasks:\n  - task_key: same\n    notebook_task: {notebook_path: /one}\n    libraries:\n      - pypi: {package: é}\n  - task_key: same\n    notebook_task: {notebook_path: /two}\n    depends_on:\n      - task_key: same\njob_clusters:\n  - job_cluster_key: shared\n    new_cluster: {node_type_id: i3.xlarge}\nparameters:\n  - name: env\n    default: 雪🚀";
+        for source in [
+            yaml.to_string(),
+            format!("{yaml}\n"),
+            yaml.replace('\n', "\r\n"),
+        ] {
+            let output = process_impl(&source);
+            assert_eq!(output, process_impl(&source));
+            let tree: Value = serde_json::from_str(&output).unwrap();
+            assert!(tree.get("error").is_none(), "{tree}");
+            let nodes = tree["children"].as_array().unwrap();
+            assert_eq!(nodes.len(), 4);
+            for (node, id, row) in [
+                (&nodes[0], "0.task.0", 2),
+                (&nodes[0]["children"][0], "0.task.0.lib.0", 5),
+                (&nodes[1], "0.task.1", 6),
+                (&nodes[1]["children"][0], "0.task.1.dep.0", 9),
+                (&nodes[2], "0.cluster.0", 11),
+                (&nodes[3], "0.param.0", 14),
+            ] {
+                assert_eq!(node["id"], id);
+                assert_eq!(node["position"]["start_line"], row);
+                assert_eq!(
+                    node["position"]["start_col"],
+                    if row == 5 || row == 9 { 8 } else { 4 }
+                );
+            }
+            assert_ne!(nodes[0]["position"], nodes[1]["position"]);
+            assert_raw_source_ranges(&tree, &source);
+        }
+    }
+
     #[test]
     fn large_workflows_keep_last_task_byte_ranges() {
         for count in [500, 2000] {

@@ -30,7 +30,7 @@ struct SourceMap<'a> {
 }
 impl<'a> SourceMap<'a> {
     fn new(source: &'a str) -> Self {
-        let lines: Vec<_> = source.lines().collect();
+        let lines: Vec<_> = source.split('\n').collect();
         let unicode = lines
             .iter()
             .enumerate()
@@ -49,7 +49,11 @@ impl<'a> SourceMap<'a> {
     }
     fn point(&self, mark: Marker) -> (u32, u32) {
         let line = mark.line().saturating_sub(1);
-        let text = self.lines.get(line).copied().unwrap_or("");
+        let Some(text) = self.lines.get(line).copied() else {
+            // The scanner may emit an end marker on a synthetic row past EOF.
+            let last = self.lines.len() - 1;
+            return (last as u32, self.lines[last].len() as u32);
+        };
         let col = self
             .unicode
             .get(&line)
@@ -204,4 +208,61 @@ pub(crate) fn attach(node: &mut SemanticNode, source: &str, is_json: bool) -> Re
     assign(node, &mut |path| {
         at(&root, path).map(|span| span.position.clone())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Obtain real scanner markers without relying on a public Marker constructor.
+    fn marker_at(row: usize, col: usize) -> Marker {
+        let yaml = format!("{}{}[]", "\n".repeat(row), " ".repeat(col));
+        let mut events = Events(Vec::new());
+        Parser::new_from_str(&yaml)
+            .load(&mut events, false)
+            .unwrap();
+        let mark = events
+            .0
+            .into_iter()
+            .find_map(|(event, mark)| matches!(event, Event::SequenceStart(..)).then_some(mark))
+            .unwrap();
+        assert_eq!((mark.line(), mark.col()), (row + 1, col));
+        mark
+    }
+
+    #[test]
+    fn scanner_points_at_or_beyond_eof_use_the_exact_raw_source_end() {
+        for (source, eof, eof_scalar_col) in [
+            ("", (0, 0), 0),
+            ("name: job\ntasks: []", (1, 9), 9),
+            ("name: job\ntasks: []\n", (2, 0), 0),
+            ("name: job\r\ntasks: []", (1, 9), 9),
+            ("name: job\r\ntasks: []\r\n", (2, 0), 0),
+            ("é雪🚀", (0, 9), 3),
+            ("é\r\n雪", (1, 3), 1),
+        ] {
+            let map = SourceMap::new(source);
+            assert_eq!(
+                map.point(marker_at(eof.0 as usize, eof_scalar_col)),
+                eof,
+                "{source:?}"
+            );
+            assert_eq!(map.point(marker_at(eof.0 as usize, 100)), eof, "{source:?}");
+            assert_eq!(map.point(marker_at(10, 0)), eof, "{source:?}");
+            assert_eq!(map.point(marker_at(10, 100)), eof, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn scanner_columns_map_to_raw_utf8_byte_boundaries_including_cr() {
+        let map = SourceMap::new("é雪🚀\r\nβ");
+        for (col, byte) in [(0, 0), (1, 2), (2, 5), (3, 9), (4, 10), (100, 10)] {
+            assert_eq!(map.point(marker_at(0, col)), (0, byte));
+        }
+        assert_eq!(map.point(marker_at(1, 0)), (1, 0));
+        assert_eq!(map.point(marker_at(1, 1)), (1, 2));
+        assert_eq!(map.point(marker_at(1, 100)), (1, 2));
+        let ascii = SourceMap::new("a\r\nb");
+        assert_eq!(ascii.point(marker_at(0, 100)), (0, 2));
+    }
 }
