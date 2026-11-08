@@ -117,6 +117,37 @@ impl<'a> SourceMap<'a> {
             .checked_sub(1)?;
         Some((line as u32, (offset - self.starts[line]) as u32))
     }
+
+    fn alias_key_position(&self, marker: Marker) -> Result<Position, String> {
+        let (start_line, start_col) = self.point(marker);
+        let begin = self.starts[start_line as usize] + start_col as usize;
+        let raw = self
+            .source
+            .get(begin..)
+            .ok_or("Invalid YAML alias key span")?;
+        if !raw.starts_with('*') {
+            return Err("Missing YAML alias key token".into());
+        }
+        // Match yaml-rust2's anchor-name boundary: non-space, non-flow chars.
+        let length = raw
+            .char_indices()
+            .skip(1)
+            .take_while(|(_, c)| {
+                !matches!(
+                    *c,
+                    ' ' | '\t' | '\r' | '\n' | ',' | '[' | ']' | '{' | '}' | '\0'
+                )
+            })
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .ok_or("Empty YAML alias key token")?;
+        Ok(Position {
+            start_line,
+            start_col,
+            end_line: start_line,
+            end_col: start_col + length as u32,
+        })
+    }
 }
 fn read_node(
     events: &[(Event, Marker)],
@@ -163,7 +194,22 @@ fn read_node(
         Event::MappingStart(anchor, _) => {
             let mut items = BTreeMap::new();
             while !matches!(events.get(*cursor), Some((Event::MappingEnd, _))) {
-                let key = read_node(events, cursor, source, anchors, depth + 1)?;
+                let (key_event, key_mark) = events
+                    .get(*cursor)
+                    .ok_or("Missing YAML mapping key")?
+                    .clone();
+                if matches!(
+                    key_event,
+                    Event::Scalar(_, TScalarStyle::Literal | TScalarStyle::Folded, _, _)
+                ) {
+                    return Err("Unsupported multiline or block YAML mapping key".into());
+                }
+                let mut key = read_node(events, cursor, source, anchors, depth + 1)?;
+                if matches!(key_event, Event::Alias(_)) {
+                    key.position = source.alias_key_position(key_mark)?;
+                } else if key.position.start_line != key.position.end_line {
+                    return Err("Unsupported multiline or block YAML mapping key".into());
+                }
                 if items.is_empty() {
                     first_key = Some((key.position.start_line, key.position.start_col));
                 }

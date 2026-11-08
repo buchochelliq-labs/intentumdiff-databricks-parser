@@ -148,6 +148,57 @@ fn numeric_and_string_payload_leaves_keep_their_own_raw_tokens() {
     }
 }
 
+#[test]
+fn yaml_alias_mapping_keys_use_the_actual_alias_occurrence() {
+    for source in [
+        "name: etl\ntasks: []\nkey: &k a\nfuture:\n  *k : 1",
+        "name: etl\r\ntasks: []\r\nkey: &k 雪🚀\r\nfuture:\r\n  *k : 1\r\n",
+    ] {
+        let node = tree(source);
+        valid(&node, source, &mut HashSet::new());
+        fn find(node: &SemanticNode) -> Option<&SemanticNode> {
+            if node.node_type == "property" && (node.label == "a" || node.label == "雪🚀") {
+                return Some(node);
+            }
+            node.children.iter().find_map(find)
+        }
+        let key = find(&node).unwrap();
+        assert_eq!(slice(source, &key.position), "*k");
+        assert_eq!(key.position.start_line, 4);
+        let scalar = &key.children[0];
+        assert_eq!(scalar.label, "1");
+        assert_eq!(slice(source, &scalar.position), "1");
+    }
+}
+
+#[test]
+fn complex_multiline_yaml_keys_error_without_rejecting_multiline_values() {
+    for key in [
+        ">-\n    a\n    b",
+        "|-\n    a\n    b",
+        "\"a\n    b\"",
+        "a\n    b",
+    ] {
+        let source = format!("name: etl\ntasks: []\nfuture:\n  ? {key}\n  : 1");
+        let result: Value = serde_json::from_str(&process_impl(&source)).unwrap();
+        let error = result["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{result}"));
+        assert!(
+            error.contains("Unsupported multiline or block YAML mapping key"),
+            "{error}"
+        );
+    }
+    for source in [
+        "name: etl\ntasks: []\nfuture:\n  literal: |-\n    a\n    b\n  folded: >-\n    a\n    b\n  quoted: \"a\n    b\"\n",
+        "name: etl\ntasks: []\nfuture:\n  plain: a\n    b\n  'a b': 1\n  \"\": 2\n",
+    ] {
+        let node = tree(source);
+        valid(&node, source, &mut HashSet::new());
+        assert!(labels(&node).contains(&"a b"));
+    }
+}
+
 fn tree(source: &str) -> SemanticNode {
     let output = process_impl(source);
     serde_json::from_str(&output).unwrap_or_else(|error| panic!("{error}: {output}"))
