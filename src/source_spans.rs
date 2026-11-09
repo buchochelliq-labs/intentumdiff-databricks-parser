@@ -148,6 +148,10 @@ impl<'a> SourceMap<'a> {
             end_col: start_col + length as u32,
         })
     }
+
+    fn alias_position(&self, marker: Marker) -> Result<Position, String> {
+        self.alias_key_position(marker)
+    }
 }
 fn read_node(
     events: &[(Event, Marker)],
@@ -177,10 +181,19 @@ fn read_node(
             (Children::Scalar(text), anchor, end)
         }
         Event::Alias(anchor) => {
-            return anchors
+            let mut alias = anchors
                 .get(&anchor)
                 .cloned()
-                .ok_or_else(|| "Unresolved YAML source anchor".into())
+                .ok_or_else(|| "Unresolved YAML source anchor".to_string())?;
+            // Scalar aliases have the anchor's decoded value but their own
+            // source occurrence. Point the scalar fact at `*name` so a change
+            // to one alias does not report the unchanged anchor declaration.
+            // Collections retain child spans at their declarations; only their
+            // aggregate occurrence is the alias token.
+            if matches!(alias.children, Children::Scalar(_)) {
+                alias.position = source.alias_position(start)?;
+            }
+            return Ok(alias);
         }
         Event::SequenceStart(anchor, _) => {
             let mut items = Vec::new();

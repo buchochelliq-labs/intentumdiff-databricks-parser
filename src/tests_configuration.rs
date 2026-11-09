@@ -172,6 +172,24 @@ fn yaml_alias_mapping_keys_use_the_actual_alias_occurrence() {
 }
 
 #[test]
+fn yaml_scalar_alias_values_anchor_each_reference_occurrence() {
+    let old = "name: etl\ntasks: []\nfirst: &a old\nsecond: &b new\nparameters:\n  - name: env\n    default: *a\n";
+    let new = old.replace("default: *a", "default: *b");
+    let (before, after) = pair(old, &new);
+    for (node, source, token, expected) in [
+        (&before, old, "*a", "old"),
+        (&after, new.as_str(), "*b", "new"),
+    ] {
+        let parameter = node_by_id(node, "0.param.0").unwrap();
+        let property = configuration_property(parameter, "default").unwrap();
+        let scalar = &property.children[0];
+        assert_eq!(scalar.node_type, "string");
+        assert_eq!(scalar.label, expected);
+        assert_eq!(slice(source, &scalar.position), token);
+    }
+}
+
+#[test]
 fn complex_multiline_yaml_keys_error_without_rejecting_multiline_values() {
     for key in [
         ">-\n    a\n    b",
@@ -196,6 +214,110 @@ fn complex_multiline_yaml_keys_error_without_rejecting_multiline_values() {
         let node = tree(source);
         valid(&node, source, &mut HashSet::new());
         assert!(labels(&node).contains(&"a b"));
+    }
+}
+
+fn node_by_id<'a>(node: &'a SemanticNode, id: &str) -> Option<&'a SemanticNode> {
+    if node.id == id {
+        return Some(node);
+    }
+    node.children.iter().find_map(|child| node_by_id(child, id))
+}
+
+fn configuration_property<'a>(
+    node: &'a SemanticNode,
+    name: &str,
+) -> Option<&'a SemanticNode> {
+    if node.node_type == "property" && node.label == name {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| configuration_property(child, name))
+}
+
+#[test]
+fn compound_domain_labels_keep_independent_component_identity() {
+    for (old, new, id, field, old_value, new_value) in [
+        (
+            r#"{"name":"etl","tasks":[],"parameters":[{"name":"a : b","default":"c"}]}"#,
+            r#"{"name":"etl","tasks":[],"parameters":[{"name":"a","default":"b : c"}]}"#,
+            "0.param.0",
+            "default",
+            "c",
+            "b : c",
+        ),
+        (
+            r#"{"name":"etl","tasks":[],"job_clusters":[{"job_cluster_key":"cpu (i3)","new_cluster":{"node_type_id":"large"}}]}"#,
+            r#"{"name":"etl","tasks":[],"job_clusters":[{"job_cluster_key":"cpu","new_cluster":{"node_type_id":"i3) (large"}}]}"#,
+            "0.cluster.0",
+            "node_type_id",
+            "large",
+            "i3) (large",
+        ),
+    ] {
+        let old_value_tree: Value = serde_json::from_str(old).unwrap();
+        let new_value_tree: Value = serde_json::from_str(new).unwrap();
+        for (old_source, new_source) in [
+            (old.to_owned(), new.to_owned()),
+            (
+                serde_yaml::to_string(&old_value_tree).unwrap(),
+                serde_yaml::to_string(&new_value_tree).unwrap(),
+            ),
+        ] {
+            let (before, after) = pair(&old_source, &new_source);
+            let before = node_by_id(&before, id).unwrap();
+            let after = node_by_id(&after, id).unwrap();
+            // Keep the familiar display label, but never use its ambiguous
+            // delimiter concatenation as the only semantic identity.
+            assert_eq!(before.label, after.label);
+            for (node, source, expected) in [
+                (before, old_source.as_str(), old_value),
+                (after, new_source.as_str(), new_value),
+            ] {
+                let property = configuration_property(node, field).unwrap();
+                let key: String = serde_yaml::from_str(slice(source, &property.position)).unwrap();
+                assert_eq!(key, field);
+                let value = &property.children[0];
+                assert_eq!(value.node_type, "string");
+                assert_eq!(value.label, expected);
+                let actual: String = serde_yaml::from_str(slice(source, &value.position)).unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn modeled_defaults_and_cluster_types_keep_typed_value_anchors() {
+    for (source, id, field, kind, label, token) in [
+        (
+            r#"{"name":"etl","tasks":[],"parameters":[{"name":"env","default":"dev"}]}"#,
+            "0.param.0", "default", "string", "dev", r#""dev""#,
+        ),
+        (
+            r#"{"name":"etl","tasks":[],"parameters":[{"name":"rate","default":0.100000000000000000001}]}"#,
+            "0.param.0", "default", "number", "0.100000000000000000001", "0.100000000000000000001",
+        ),
+        (
+            r#"{"name":"etl","tasks":[],"parameters":[{"name":"switch","default":false}]}"#,
+            "0.param.0", "default", "boolean", "false", "false",
+        ),
+        (
+            r#"{"name":"etl","tasks":[],"job_clusters":[{"job_cluster_key":"cpu","new_cluster":{"node_type_id":"i3"}}]}"#,
+            "0.cluster.0", "node_type_id", "string", "i3", r#""i3""#,
+        ),
+    ] {
+        let tree = tree(source);
+        valid(&tree, source, &mut HashSet::new());
+        let domain = node_by_id(&tree, id).unwrap();
+        let property = configuration_property(domain, field).unwrap();
+        assert_eq!(slice(source, &property.position), format!("\"{field}\""));
+        assert_eq!(property.children.len(), 1);
+        let value = &property.children[0];
+        assert_eq!(value.node_type, kind);
+        assert_eq!(value.label, label);
+        assert_eq!(slice(source, &value.position), token);
     }
 }
 

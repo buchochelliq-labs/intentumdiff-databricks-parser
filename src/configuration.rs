@@ -123,8 +123,8 @@ impl Context<'_, '_> {
         Ok(())
     }
 
-    // A domain label already carries this value. Keep its type and key presence
-    // without duplicating the value as another review fact.
+    // An injective domain label already carries this value. Keep its type and
+    // key presence without duplicating the value as another review fact.
     fn marker(
         &mut self,
         node: &mut SemanticNode,
@@ -245,7 +245,7 @@ impl Context<'_, '_> {
                     "job" => key == "name",
                     "task" => key == "task_key",
                     "cluster" => selected_cluster_key == Some(key.as_str()),
-                    "parameter" => key == "name" || key == "default",
+                    "parameter" => key == "name",
                     "library" => library_key == Some(key.as_str()),
                     "depends_on" => key == "task_key",
                     _ => false,
@@ -258,33 +258,12 @@ impl Context<'_, '_> {
                 if value.is_number() {
                     let name = map.get("name").and_then(Value::as_str).unwrap_or("");
                     node.label = format!("{} : {}", name, self.atom(&field_path)?);
-                    self.marker(node, key, "number_field", &field_path)?;
-                    continue;
-                }
-                if value.is_boolean() {
-                    self.marker(node, key, "boolean_field", &field_path)?;
-                    continue;
                 }
             }
-            if node.node_type == "cluster" && key == "new_cluster" {
-                if let Some(values) = value.as_object() {
-                    if values.get("node_type_id").is_some_and(Value::is_string) {
-                        let mut residual = self.value(value, &field_path, 0)?;
-                        if let ConfigKind::Mapping(entries) = &mut residual.kind {
-                            entries.retain(|entry| entry.key != "node_type_id");
-                        }
-                        let key_position = self.key_position(&field_path)?;
-                        self.projected(node, key, &key_position, &residual)?;
-                        self.marker(
-                            node,
-                            "node_type_id",
-                            "string_field",
-                            &child_path(&field_path, "node_type_id"),
-                        )?;
-                        continue;
-                    }
-                }
-            }
+            // Parameter defaults and new_cluster.node_type_id are independent
+            // components of compound display labels. Retain their typed values:
+            // delimiter concatenation alone can give distinct settings the same
+            // human label. Ordinary diffing then selects precise scalar anchors.
             self.field(node, key, value, &field_path)?;
         }
         rebuild(node)
