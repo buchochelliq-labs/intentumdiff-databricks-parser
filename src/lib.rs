@@ -15,8 +15,12 @@
 //!   parameter  — each item in `parameters` (label = name : default)
 //!   library    — each library entry within a task
 
+mod configuration;
 mod json_spans;
 mod source_spans;
+
+#[cfg(test)]
+mod tests_configuration;
 
 use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
 use serde_json::Value;
@@ -239,7 +243,14 @@ fn parse_job(val: &Value, source: &str, is_json: bool) -> String {
     }
 
     let mut root = parent_node("0", "job", &job_name, children);
-    if let Err(error) = source_spans::attach(&mut root, source, is_json) {
+    let mut spans = match source_spans::SourceSpans::new(source, is_json) {
+        Ok(spans) => spans,
+        Err(error) => return serde_json::json!({"error": error}).to_string(),
+    };
+    if let Err(error) = spans
+        .attach(&mut root)
+        .and_then(|()| configuration::append(&mut root, val, source, &mut spans))
+    {
         return serde_json::json!({"error": error}).to_string();
     }
     match serde_json::to_string(&root) {
@@ -314,6 +325,177 @@ mod tests {
     use crate::exports::intentdiff::plugin::parser::Guest;
     use intentumdiff_plugin_sdk::testing as t;
 
+    fn assert_raw_source_ranges(node: &Value, source: &str) {
+        let lines: Vec<_> = source.split('\n').collect();
+        let position = &node["position"];
+        let endpoint = |line: &str, col: &str| {
+            let row = position[line].as_u64().expect("integer source row") as usize;
+            let byte = position[col].as_u64().expect("integer byte column") as usize;
+            let text = lines
+                .get(row)
+                .unwrap_or_else(|| panic!("{node}: row {row} outside source"));
+            assert!(
+                byte <= text.len(),
+                "{node}: column {byte} outside row {row}"
+            );
+            assert!(
+                text.is_char_boundary(byte),
+                "{node}: column {byte} splits UTF-8"
+            );
+            (row, byte)
+        };
+        assert!(endpoint("start_line", "start_col") <= endpoint("end_line", "end_col"));
+        for child in node["children"].as_array().unwrap() {
+            assert_raw_source_ranges(child, source);
+        }
+    }
+
+    #[test]
+    fn yaml_root_ends_at_exact_eof_with_lf_and_crlf_variants() {
+        for (source, end_line, end_col) in [
+            ("name: job\ntasks: []", 1, 9),
+            ("name: job\ntasks: []\n", 2, 0),
+            ("name: job\r\ntasks: []", 1, 9),
+            ("name: job\r\ntasks: []\r\n", 2, 0),
+            ("name: café\ntasks: [] # 雪🚀", 1, 19),
+        ] {
+            let output = process_impl(source);
+            assert_eq!(output, process_impl(source));
+            let tree: Value = serde_json::from_str(&output).unwrap();
+            assert!(tree.get("error").is_none(), "{tree}");
+            assert_eq!(tree["position"]["end_line"], end_line, "{source:?}");
+            assert_eq!(tree["position"]["end_col"], end_col, "{source:?}");
+            assert_raw_source_ranges(&tree, source);
+        }
+    }
+
+    #[test]
+    fn partial_notebook_task_keeps_ranges_inside_original_source() {
+        for source in [
+            "name: x\ntasks:\n  - task_key: a\n    notebook_task:",
+            "tasks:\n  - task_key: ingest\n    notebook_task:",
+            "tasks:\n  - task_key: ingest\n    notebook_task:\n",
+            "tasks:\r\n  - task_key: ingest\r\n    notebook_task:",
+        ] {
+            let tree: Value = serde_json::from_str(&process_impl(source)).unwrap();
+            assert!(tree.get("error").is_none(), "{tree}");
+            assert_eq!(tree["children"][0]["id"], "0.task.0");
+            assert_eq!(
+                tree["children"][0]["position"]["start_line"],
+                if source.starts_with("name:") { 2 } else { 1 }
+            );
+            assert_eq!(tree["children"][0]["position"]["start_col"], 4);
+            assert_raw_source_ranges(&tree, source);
+        }
+        let incomplete: Value =
+            serde_json::from_str(&process_impl("tasks:\n  - task_key: \"")).unwrap();
+        assert!(incomplete["error"].is_string());
+    }
+
+    #[test]
+    fn multiblock_workflow_keeps_indexed_ids_and_distinct_ranges_at_eof() {
+        let yaml = "name: café\ntasks:\n  - task_key: same\n    notebook_task: {notebook_path: /one}\n    libraries:\n      - pypi: {package: é}\n  - task_key: same\n    notebook_task: {notebook_path: /two}\n    depends_on:\n      - task_key: same\njob_clusters:\n  - job_cluster_key: shared\n    new_cluster: {node_type_id: i3.xlarge}\nparameters:\n  - name: env\n    default: 雪🚀";
+        for source in [
+            yaml.to_string(),
+            format!("{yaml}\n"),
+            yaml.replace('\n', "\r\n"),
+        ] {
+            let output = process_impl(&source);
+            assert_eq!(output, process_impl(&source));
+            let tree: Value = serde_json::from_str(&output).unwrap();
+            assert!(tree.get("error").is_none(), "{tree}");
+            let nodes = tree["children"].as_array().unwrap();
+            let domain: Vec<_> = nodes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node["node_type"].as_str(),
+                        Some("task" | "cluster" | "parameter")
+                    )
+                })
+                .collect();
+            assert_eq!(domain.len(), 4);
+            let find = |id: &str, kind: &str| {
+                let node = domain
+                    .iter()
+                    .copied()
+                    .find(|node| node["id"] == id)
+                    .unwrap();
+                assert_eq!(node["node_type"], kind);
+                node
+            };
+            let task0 = find("0.task.0", "task");
+            let task1 = find("0.task.1", "task");
+            let library = task0["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["id"] == "0.task.0.lib.0")
+                .unwrap();
+            let dependency = task1["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["id"] == "0.task.1.dep.0")
+                .unwrap();
+            for (node, id, row) in [
+                (task0, "0.task.0", 2),
+                (library, "0.task.0.lib.0", 5),
+                (task1, "0.task.1", 6),
+                (dependency, "0.task.1.dep.0", 9),
+                (find("0.cluster.0", "cluster"), "0.cluster.0", 11),
+                (find("0.param.0", "parameter"), "0.param.0", 14),
+            ] {
+                assert_eq!(node["id"], id);
+                assert_eq!(node["position"]["start_line"], row);
+                assert_eq!(
+                    node["position"]["start_col"],
+                    if row == 5 || row == 9 { 8 } else { 4 }
+                );
+            }
+            assert_ne!(task0["position"], task1["position"]);
+            let configuration: Vec<_> =
+                nodes.iter().filter(|node| !domain.contains(node)).collect();
+            assert_eq!(configuration.len(), 4);
+            for (node, kind, label) in configuration
+                .into_iter()
+                .zip([
+                    ("array_field", "tasks"),
+                    ("array_field", "job_clusters"),
+                    ("array_field", "parameters"),
+                    ("string_field", "name"),
+                ])
+                .map(|(node, (kind, label))| (node, kind, label))
+            {
+                assert_eq!(node["node_type"], kind);
+                assert_eq!(node["label"], label);
+                let p = &node["position"];
+                assert_eq!(p["start_line"], p["end_line"]);
+                let line = source
+                    .split('\n')
+                    .nth(p["start_line"].as_u64().unwrap() as usize)
+                    .unwrap();
+                assert_eq!(
+                    &line[p["start_col"].as_u64().unwrap() as usize
+                        ..p["end_col"].as_u64().unwrap() as usize],
+                    label
+                );
+            }
+            fn unique(node: &Value, seen: &mut std::collections::HashSet<String>) {
+                assert!(
+                    seen.insert(node["id"].as_str().unwrap().to_owned()),
+                    "duplicate {}",
+                    node["id"]
+                );
+                for child in node["children"].as_array().unwrap() {
+                    unique(child, seen);
+                }
+            }
+            unique(&tree, &mut std::collections::HashSet::new());
+            assert_raw_source_ranges(&tree, &source);
+        }
+    }
+
     #[test]
     fn large_workflows_keep_last_task_byte_ranges() {
         for count in [500, 2000] {
@@ -335,7 +517,12 @@ mod tests {
                 );
                 let tree: Value = serde_json::from_str(&output).unwrap();
                 assert!(tree.get("error").is_none(), "{tree}");
-                let nodes = tree["children"].as_array().unwrap();
+                let nodes: Vec<_> = tree["children"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|node| node["node_type"] == "task")
+                    .collect();
                 assert_eq!(nodes.len(), count);
                 if source.contains('\n') {
                     assert_eq!(nodes[count - 1]["position"]["start_line"], count * 2);
