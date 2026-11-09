@@ -15,8 +15,12 @@
 //!   parameter  — each item in `parameters` (label = name : default)
 //!   library    — each library entry within a task
 
+mod configuration;
 mod json_spans;
 mod source_spans;
+
+#[cfg(test)]
+mod tests_configuration;
 
 use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
 use serde_json::Value;
@@ -239,7 +243,14 @@ fn parse_job(val: &Value, source: &str, is_json: bool) -> String {
     }
 
     let mut root = parent_node("0", "job", &job_name, children);
-    if let Err(error) = source_spans::attach(&mut root, source, is_json) {
+    let mut spans = match source_spans::SourceSpans::new(source, is_json) {
+        Ok(spans) => spans,
+        Err(error) => return serde_json::json!({"error": error}).to_string(),
+    };
+    if let Err(error) = spans
+        .attach(&mut root)
+        .and_then(|()| configuration::append(&mut root, val, source, &mut spans))
+    {
         return serde_json::json!({"error": error}).to_string();
     }
     match serde_json::to_string(&root) {
@@ -394,14 +405,46 @@ mod tests {
             let tree: Value = serde_json::from_str(&output).unwrap();
             assert!(tree.get("error").is_none(), "{tree}");
             let nodes = tree["children"].as_array().unwrap();
-            assert_eq!(nodes.len(), 4);
+            let domain: Vec<_> = nodes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node["node_type"].as_str(),
+                        Some("task" | "cluster" | "parameter")
+                    )
+                })
+                .collect();
+            assert_eq!(domain.len(), 4);
+            let find = |id: &str, kind: &str| {
+                let node = domain
+                    .iter()
+                    .copied()
+                    .find(|node| node["id"] == id)
+                    .unwrap();
+                assert_eq!(node["node_type"], kind);
+                node
+            };
+            let task0 = find("0.task.0", "task");
+            let task1 = find("0.task.1", "task");
+            let library = task0["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["id"] == "0.task.0.lib.0")
+                .unwrap();
+            let dependency = task1["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["id"] == "0.task.1.dep.0")
+                .unwrap();
             for (node, id, row) in [
-                (&nodes[0], "0.task.0", 2),
-                (&nodes[0]["children"][0], "0.task.0.lib.0", 5),
-                (&nodes[1], "0.task.1", 6),
-                (&nodes[1]["children"][0], "0.task.1.dep.0", 9),
-                (&nodes[2], "0.cluster.0", 11),
-                (&nodes[3], "0.param.0", 14),
+                (task0, "0.task.0", 2),
+                (library, "0.task.0.lib.0", 5),
+                (task1, "0.task.1", 6),
+                (dependency, "0.task.1.dep.0", 9),
+                (find("0.cluster.0", "cluster"), "0.cluster.0", 11),
+                (find("0.param.0", "parameter"), "0.param.0", 14),
             ] {
                 assert_eq!(node["id"], id);
                 assert_eq!(node["position"]["start_line"], row);
@@ -410,7 +453,45 @@ mod tests {
                     if row == 5 || row == 9 { 8 } else { 4 }
                 );
             }
-            assert_ne!(nodes[0]["position"], nodes[1]["position"]);
+            assert_ne!(task0["position"], task1["position"]);
+            let configuration: Vec<_> =
+                nodes.iter().filter(|node| !domain.contains(node)).collect();
+            assert_eq!(configuration.len(), 4);
+            for (node, kind, label) in configuration
+                .into_iter()
+                .zip([
+                    ("array_field", "tasks"),
+                    ("array_field", "job_clusters"),
+                    ("array_field", "parameters"),
+                    ("string_field", "name"),
+                ])
+                .map(|(node, (kind, label))| (node, kind, label))
+            {
+                assert_eq!(node["node_type"], kind);
+                assert_eq!(node["label"], label);
+                let p = &node["position"];
+                assert_eq!(p["start_line"], p["end_line"]);
+                let line = source
+                    .split('\n')
+                    .nth(p["start_line"].as_u64().unwrap() as usize)
+                    .unwrap();
+                assert_eq!(
+                    &line[p["start_col"].as_u64().unwrap() as usize
+                        ..p["end_col"].as_u64().unwrap() as usize],
+                    label
+                );
+            }
+            fn unique(node: &Value, seen: &mut std::collections::HashSet<String>) {
+                assert!(
+                    seen.insert(node["id"].as_str().unwrap().to_owned()),
+                    "duplicate {}",
+                    node["id"]
+                );
+                for child in node["children"].as_array().unwrap() {
+                    unique(child, seen);
+                }
+            }
+            unique(&tree, &mut std::collections::HashSet::new());
             assert_raw_source_ranges(&tree, &source);
         }
     }
@@ -436,7 +517,12 @@ mod tests {
                 );
                 let tree: Value = serde_json::from_str(&output).unwrap();
                 assert!(tree.get("error").is_none(), "{tree}");
-                let nodes = tree["children"].as_array().unwrap();
+                let nodes: Vec<_> = tree["children"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|node| node["node_type"] == "task")
+                    .collect();
                 assert_eq!(nodes.len(), count);
                 if source.contains('\n') {
                     assert_eq!(nodes[count - 1]["position"]["start_line"], count * 2);
