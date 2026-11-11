@@ -527,3 +527,190 @@ fn complete_configuration_keeps_identity_map_order_and_layout_controls() {
     }
     assert_eq!(process_impl(&json), process_impl(&json));
 }
+
+// Exact old source of issue #7: Python `json.dumps(base, indent=2)` (insertion
+// key order, two-space indent). Each edit is the issue's single-field change,
+// applied as the one token replacement that reproduces `json.dumps(changed)`.
+const ISSUE_7_OLD: &str = r#"{
+  "name": "etl",
+  "tasks": [
+    {
+      "task_key": "run",
+      "notebook_task": {
+        "notebook_path": "/safe",
+        "base_parameters": {
+          "env": "dev"
+        }
+      },
+      "libraries": [
+        {
+          "pypi": {
+            "package": "safe==1"
+          }
+        }
+      ],
+      "timeout_seconds": 10,
+      "depends_on": [
+        {
+          "task_key": "previous",
+          "outcome": "true"
+        }
+      ]
+    }
+  ],
+  "job_clusters": [
+    {
+      "job_cluster_key": "cpu",
+      "new_cluster": {
+        "node_type_id": "Standard",
+        "num_workers": 1,
+        "spark_version": "15.4"
+      }
+    }
+  ],
+  "schedule": {
+    "quartz_cron_expression": "0 0 1 * * ?",
+    "timezone_id": "UTC"
+  }
+}"#;
+
+fn scalar_nodes<'a>(node: &'a SemanticNode, out: &mut Vec<&'a SemanticNode>) {
+    if node.children.is_empty() && matches!(node.node_type.as_str(), "string" | "number") {
+        out.push(node);
+    }
+    for child in &node.children {
+        scalar_nodes(child, out);
+    }
+}
+
+#[test]
+fn issue_7_exact_pairs_keep_changed_value_with_exact_source_span() {
+    // (case, old token, new token, value label, row, start col, end col)
+    let edits = [
+        (
+            "notebook_path",
+            r#""/safe""#,
+            r#""/danger""#,
+            "/danger",
+            6,
+            25,
+            34,
+        ),
+        (
+            "task_parameters",
+            r#""dev""#,
+            r#""prod""#,
+            "prod",
+            8,
+            17,
+            23,
+        ),
+        (
+            "library_package",
+            r#""safe==1""#,
+            r#""danger==2""#,
+            "danger==2",
+            14,
+            23,
+            34,
+        ),
+        ("task_timeout", "\": 10,", "\": 1000,", "1000", 18, 25, 29),
+        (
+            "dep_outcome",
+            r#""true""#,
+            r#""false""#,
+            "false",
+            22,
+            21,
+            28,
+        ),
+        ("cluster_workers", "\": 1,", "\": 100,", "100", 32, 23, 26),
+        (
+            "schedule",
+            r#""0 0 1 * * ?""#,
+            r#""0 0 2 * * ?""#,
+            "0 0 2 * * ?",
+            38,
+            30,
+            43,
+        ),
+    ];
+    let before = tree(ISSUE_7_OLD);
+    valid(&before, ISSUE_7_OLD, &mut HashSet::new());
+    let mut old_scalars = Vec::new();
+    scalar_nodes(&before, &mut old_scalars);
+    for (case, old_token, new_token, label, row, start, end) in edits {
+        assert_eq!(ISSUE_7_OLD.matches(old_token).count(), 1, "{case}");
+        let new = ISSUE_7_OLD.replacen(old_token, new_token, 1);
+        let (_, after) = pair(ISSUE_7_OLD, &new);
+        let mut new_scalars = Vec::new();
+        scalar_nodes(&after, &mut new_scalars);
+        let changed: Vec<_> = new_scalars
+            .iter()
+            .filter(|node| {
+                !old_scalars
+                    .iter()
+                    .any(|old| old.id == node.id && old.label == node.label)
+            })
+            .collect();
+        assert_eq!(changed.len(), 1, "{case}: {changed:?}");
+        let node = changed[0];
+        assert_eq!(node.label, label, "{case}");
+        let p = &node.position;
+        assert_eq!(
+            (p.start_line, p.start_col, p.end_line, p.end_col),
+            (row, start, row, end),
+            "{case}"
+        );
+        assert_eq!(slice(&new, p).trim_matches('"'), label, "{case}");
+        // The old side carries the replaced value under the same identity.
+        let old = node_by_id(&before, &node.id).unwrap();
+        assert_eq!(
+            slice(ISSUE_7_OLD, &old.position),
+            old_token.trim_start_matches("\": ").trim_end_matches(','),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn issue_7_layout_and_identity_controls_stay_style_only() {
+    let compact =
+        serde_json::to_string(&serde_json::from_str::<Value>(ISSUE_7_OLD).unwrap()).unwrap();
+    let crlf = ISSUE_7_OLD.replace('\n', "\r\n");
+    let base = tree(ISSUE_7_OLD).structural_hash;
+    for source in [ISSUE_7_OLD.to_string(), compact, crlf] {
+        let node = tree(&source);
+        valid(&node, &source, &mut HashSet::new());
+        assert_eq!(
+            node.structural_hash, base,
+            "layout became payload: {source}"
+        );
+    }
+}
+
+#[test]
+fn issue_8_partial_yaml_maps_scanner_eof_to_exact_source_end() {
+    // Exact issue source: the scanner's end marker sits past the last row.
+    let source = "name: x\ntasks:\n  - task_key: a\n    notebook_task:";
+    let root = tree(source);
+    let mut ids = HashSet::new();
+    valid(&root, source, &mut ids);
+    let at = |id: &str| {
+        let p = &node_by_id(&root, id).unwrap().position;
+        (p.start_line, p.start_col, p.end_line, p.end_col)
+    };
+    assert_eq!(at("0"), (0, 0, 3, 18));
+    assert_eq!(at("0.task.0"), (2, 4, 3, 18));
+    assert_eq!(node_by_id(&root, "0.task.0").unwrap().node_type, "task");
+    for (source, end) in [
+        (format!("{source}\n"), (4, 0)),
+        (source.replace('\n', "\r\n"), (3, 18)),
+        (source.replace("task_key: a", "task_key: é雪"), (3, 18)),
+    ] {
+        let root = tree(&source);
+        valid(&root, &source, &mut HashSet::new());
+        let p = &root.position;
+        assert_eq!((p.end_line, p.end_col), end, "{source:?}");
+    }
+}
